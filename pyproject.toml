@@ -30,10 +30,11 @@ nsys-ai = "nsys_tui.__main__:main"
 nsys-tui = "nsys_tui.__main__:main"
 
 [project.optional-dependencies]
-agent = ["anthropic>=0.20.0"]
-ai = ["anthropic>=0.20.0"]  # backward compat alias
+agent = ["anthropic>=0.20.0", "litellm>=1.0.0"]
+ai = ["anthropic>=0.20.0", "litellm>=1.0.0"]  # backward compat alias
+chat = ["litellm>=1.0.0", "textual>=0.80.0"]  # Textual AI chat TUI
 dev = ["pytest>=7.0"]
-all = ["nsys-ai[agent]"]
+all = ["nsys-ai[agent,chat]"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -158,15 +158,19 @@ def main():
     p.add_argument("--no-browser", action="store_true", help="Don't auto-open browser")
 
     # ── tui ──
-    p = sub.add_parser("tui", help="Terminal tree view (rich)")
+    p = sub.add_parser("tui", help="Terminal tree view; press A for AI chat")
     _add_gpu_trim(p)
     p.add_argument("--depth", type=int, default=-1, help="Max tree depth (-1=all)")
     p.add_argument("--min-ms", type=float, default=0, help="Min duration to show (ms)")
 
     # ── timeline ──
-    p = sub.add_parser("timeline", help="Horizontal timeline view (Perfetto-style)")
+    p = sub.add_parser("timeline", help="Horizontal timeline; press A for AI chat")
     _add_gpu_trim(p)
     p.add_argument("--min-ms", type=float, default=0, help="Min duration to show (ms)")
+
+    # ── chat ──
+    p = sub.add_parser("chat", help="AI chat TUI with top-kernel navigator (requires litellm + textual)")
+    p.add_argument("profile", help="Path to profile (.sqlite or .nsys-rep)")
 
     # ── skill ──
     p = sub.add_parser("skill", help="List or run analysis skills")
@@ -411,6 +415,14 @@ def main():
             from .tui_timeline import run_timeline
             run_timeline(args.profile, args.gpu, _parse_trim(args),
                          min_ms=args.min_ms)
+
+        elif args.command == "chat":
+            try:
+                from .tui_textual import run_chat_tui
+            except ImportError:
+                print("Error: 'textual' package is required. Install with: pip install 'textual>=0.80.0'")
+                return
+            run_chat_tui(args.profile)
 
         elif args.command == "skill":
             from .skills.registry import list_skills, all_skills, run_skill as _run_skill

@@ -1,5 +1,5 @@
 """
-tui.py — Interactive Terminal UI for NVTX tree view.
+tui.py - Interactive Terminal UI for NVTX tree view.
 
 Renders the NVTX tree in an interactive curses-based terminal UI.
 Designed for use over SSH on remote servers where opening a browser is
@@ -22,12 +22,16 @@ Keybindings:
     0               Unlimited depth
     d               Toggle demangled kernel names
     t               Toggle start/end timestamps
+    A               Toggle AI chat panel (ask questions, navigate to kernel/zoom)
     q               Quit
 """
 import curses
 import os
+import threading
 from typing import Optional
 
+from . import chat as chat_mod
+from . import tui_actions
 
 def _fmt_dur(ms: float) -> str:
     if ms >= 1000:
@@ -107,7 +111,16 @@ class InteractiveTUI:
         self.bookmarks = []           # list of {name, start_ns, end_ns, cursor_path}
         self.show_bookmarks = False   # toggle right panel
 
-        # Build all nodes in DFS order — this is the source of truth
+        # Chat pane (AI Brain & Navigator)
+        self.chat_enabled = False
+        self.chat_messages: list[dict] = []  # {"role": "user"|"assistant"|"system", "content": str}
+        self.chat_input = ""
+        self.chat_input_mode = False
+        self.chat_is_running = False
+        self.chat_status_msg = ""
+        self._chat_lock = threading.Lock()
+
+        # Build all nodes in DFS order - this is the source of truth
         self.all_nodes: list[TreeNode] = []
         self._build_nodes(json_roots, 0)
 
@@ -213,7 +226,7 @@ class InteractiveTUI:
             # Text filter: if filter is active, check if this node or descendants match
             if ft:
                 if not self._node_matches_filter(node, ft):
-                    # Don't skip children — they might match
+                    # Don't skip children - they might match
                     continue
 
             visible.append(node)
@@ -375,14 +388,16 @@ class InteractiveTUI:
             stdscr.addnstr(1, 0, bar, width - 1, curses.color_pair(7))
 
             # Help line
-            help_text = " ↑↓jk:nav ←→:expand e/c:this E/C:all /:filter m:min S:save p:panel h:help q:quit"
+            help_text = " ↑↓jk:nav ←→:expand e/c:this E/C:all /:filter m:min S:save p:panel A:chat h:help q:quit"
             stdscr.addnstr(height - 1, 0, help_text[:width - 1], width - 1, curses.A_DIM)
 
             # Visible rows
             visible = self._visible_rows()
             display_height = height - 7  # header(1) + status(1) + breadcrumb(1) + tree area + detail(2) + help(1) + gap
+            if self.chat_enabled:
+                display_height -= 6  # reserve space for chat panel so tree does not overlap
 
-            # Breadcrumb hierarchy — show NVTX path of cursor's position
+            # Breadcrumb hierarchy - show NVTX path of cursor's position
             breadcrumb = ""
             if visible and 0 <= self.cursor < len(visible):
                 cur_node = visible[self.cursor]
@@ -497,7 +512,7 @@ class InteractiveTUI:
                     except curses.error:
                         pass
 
-            # ── Bookmarks panel (right side) ──
+            # -- Bookmarks panel (right side) --
             if self.show_bookmarks and self.bookmarks:
                 panel_w = min(35, width // 3)
                 panel_x = width - panel_w
@@ -521,50 +536,53 @@ class InteractiveTUI:
                     except curses.error:
                         pass
 
-            # ── Detail bar: selected node info + mini timeline ──
-            detail_y = height - 3
-            if visible and 0 <= self.cursor < len(visible):
-                sel = visible[self.cursor]
-                # Line 1: fixed-width columns — time │ dur stream │ name
-                # Col 1: time range (fixed 22 chars)
-                if sel.start_ns is not None and sel.end_ns is not None:
-                    time_col = f"{_fmt_ns(sel.start_ns)}→{_fmt_ns(sel.end_ns)}"
-                else:
-                    time_col = "?"
-                time_col = time_col.ljust(22)
-                # Col 2: duration + stream (fixed 20 chars)
-                dur_col = _fmt_dur(sel.duration_ms)
-                if sel.type == 'kernel':
-                    dur_col += f" [S{sel.stream}]"
-                if sel.relative_pct < 100:
-                    dur_col += f" {sel.relative_pct:.0f}%"
-                dur_col = dur_col.ljust(20)
-                # Col 3: name (fills rest)
-                info = f" {time_col} │ {dur_col} │ {sel.name}"
-                try:
-                    stdscr.addnstr(detail_y, 0, info[:width - 1], width - 1,
-                                   curses.A_BOLD | curses.color_pair(7))
-                except curses.error:
-                    pass
-
-                # Line 2: mini timeline bar
-                trim_start, trim_end = self.trim
-                trim_span = max(trim_end - trim_start, 1)
-                bar_width = min(width - 6, 60)
-                if bar_width > 10 and sel.start_ns is not None and sel.end_ns is not None:
-                    # Compute positions
-                    s_pos = max(0, min(bar_width - 1, int((sel.start_ns - trim_start) / trim_span * bar_width)))
-                    e_pos = max(s_pos + 1, min(bar_width, int((sel.end_ns - trim_start) / trim_span * bar_width)))
-                    bar_chars = ['─'] * bar_width
-                    for i in range(s_pos, e_pos):
-                        if i < bar_width:
-                            bar_chars[i] = '█'
-                    timeline = f" [{_fmt_ns(trim_start)}] {''.join(bar_chars)} [{_fmt_ns(trim_end)}]"
+            # -- Detail bar or chat panel --
+            if self.chat_enabled:
+                self._draw_chat_panel(stdscr, height, width)
+            else:
+                detail_y = height - 3
+                if visible and 0 <= self.cursor < len(visible):
+                    sel = visible[self.cursor]
+                    # Line 1: fixed-width columns - time │ dur stream │ name
+                    # Col 1: time range (fixed 22 chars)
+                    if sel.start_ns is not None and sel.end_ns is not None:
+                        time_col = f"{_fmt_ns(sel.start_ns)}→{_fmt_ns(sel.end_ns)}"
+                    else:
+                        time_col = "?"
+                    time_col = time_col.ljust(22)
+                    # Col 2: duration + stream (fixed 20 chars)
+                    dur_col = _fmt_dur(sel.duration_ms)
+                    if sel.type == 'kernel':
+                        dur_col += f" [S{sel.stream}]"
+                    if sel.relative_pct < 100:
+                        dur_col += f" {sel.relative_pct:.0f}%"
+                    dur_col = dur_col.ljust(20)
+                    # Col 3: name (fills rest)
+                    info = f" {time_col} │ {dur_col} │ {sel.name}"
                     try:
-                        stdscr.addnstr(detail_y + 1, 0, timeline[:width - 1], width - 1,
-                                       curses.color_pair(9))
+                        stdscr.addnstr(detail_y, 0, info[:width - 1], width - 1,
+                                       curses.A_BOLD | curses.color_pair(7))
                     except curses.error:
                         pass
+
+                    # Line 2: mini timeline bar
+                    trim_start, trim_end = self.trim
+                    trim_span = max(trim_end - trim_start, 1)
+                    bar_width = min(width - 6, 60)
+                    if bar_width > 10 and sel.start_ns is not None and sel.end_ns is not None:
+                        # Compute positions
+                        s_pos = max(0, min(bar_width - 1, int((sel.start_ns - trim_start) / trim_span * bar_width)))
+                        e_pos = max(s_pos + 1, min(bar_width, int((sel.end_ns - trim_start) / trim_span * bar_width)))
+                        bar_chars = ['─'] * bar_width
+                        for i in range(s_pos, e_pos):
+                            if i < bar_width:
+                                bar_chars[i] = '█'
+                        timeline = f" [{_fmt_ns(trim_start)}] {''.join(bar_chars)} [{_fmt_ns(trim_end)}]"
+                        try:
+                            stdscr.addnstr(detail_y + 1, 0, timeline[:width - 1], width - 1,
+                                           curses.color_pair(9))
+                        except curses.error:
+                            pass
 
             # Filter input mode
             if self.filter_mode:
@@ -592,6 +610,23 @@ class InteractiveTUI:
 
             # Handle input
             key = stdscr.getch()
+
+            # Chat input mode: intercept keys before normal handling
+            if self.chat_input_mode:
+                if key == 27:  # Esc
+                    self.chat_input_mode = False
+                    self.status_msg = 'Chat input cancelled'
+                elif key in (10, 13):  # Enter
+                    text = self.chat_input.strip()
+                    if text and not self.chat_is_running:
+                        self._start_chat_request(text)
+                        self.chat_input = ''
+                elif key in (8, 127, 263):  # Backspace
+                    self.chat_input = self.chat_input[:-1]
+                elif 32 <= key <= 126:
+                    if len(self.chat_input) < 200:
+                        self.chat_input += chr(key)
+                continue
 
             if self.threshold_mode:
                 if key == 27:  # Esc
@@ -679,6 +714,14 @@ class InteractiveTUI:
 
             if key == ord('q'):
                 break
+            elif key == ord('A'):
+                # Toggle chat pane; when opening, focus input box.
+                self.chat_enabled = not self.chat_enabled
+                self.chat_input_mode = self.chat_enabled
+                if self.chat_enabled:
+                    self.status_msg = 'Chat: ON (type your question)'
+                else:
+                    self.status_msg = 'Chat: OFF'
             elif key in (curses.KEY_UP, ord('k')):
                 self.cursor = max(0, self.cursor - 1)
                 self.selection_anchor = -1  # clear selection on normal nav
@@ -761,7 +804,7 @@ class InteractiveTUI:
             elif key == ord('C'):
                 self._collapse_all()
             elif key == ord('h'):
-                # Toggle help — just show a status message with key summary
+                # Toggle help - just show a status message with key summary
                 self.status_msg = 'e/c:expand/collapse E/C:all ←→:nav /:filter m:min S:bookmark p:panel v:view'
             elif key == ord('/'):
                 self.filter_mode = True
@@ -805,7 +848,7 @@ class InteractiveTUI:
                 self.show_bookmarks = not self.show_bookmarks
                 self.status_msg = f"Bookmarks: {'ON' if self.show_bookmarks else 'OFF'}"
             elif key == ord('G'):
-                # Jump to bookmark — show list and prompt
+                # Jump to bookmark - show list and prompt
                 if self.bookmarks:
                     self.threshold_mode = True
                     self.threshold_target = 'bookmark'
@@ -861,6 +904,257 @@ class InteractiveTUI:
                 self.threshold_target = 'trim'
                 self.threshold_input = f"{self.trim[0]/1e9:.1f} {self.trim[1]/1e9:.1f}"
                 self.status_msg = 'Enter trim: START_S END_S'
+        # End of input loop
+
+    def _draw_chat_panel(self, stdscr, height: int, width: int):
+        """Draw a simple chat panel at the bottom of the screen."""
+        panel_height = 6
+        top = max(3, height - panel_height - 3)
+        title = " AI Chat (A toggle, Enter send, Esc exit input) "
+        try:
+            stdscr.addnstr(top, 0, title.ljust(width - 1), width - 1,
+                           curses.A_BOLD | curses.color_pair(7))
+        except curses.error:
+            return
+
+        msg_area_lines = panel_height - 3
+        with self._chat_lock:
+            msgs = self.chat_messages[-msg_area_lines:]
+            is_running = self.chat_is_running
+            status = self.chat_status_msg
+            input_text = self.chat_input
+        start_y = top + 1
+        for i in range(msg_area_lines):
+            y = start_y + i
+            if y >= height - 2:
+                break
+            line = ""
+            if i < len(msgs):
+                m = msgs[i]
+                role = m.get("role", "user")
+                prefix = "U:" if role == "user" else ("A:" if role == "assistant" else "S:")
+                line = f"{prefix} {m.get('content', '')}"
+            try:
+                stdscr.addnstr(y, 0, line[: width - 1].ljust(width - 1), width - 1,
+                               curses.A_NORMAL)
+            except curses.error:
+                break
+
+        input_y = top + panel_height - 2
+        prompt = "> " + input_text
+        if self.chat_input_mode:
+            prompt += "█"
+        try:
+            stdscr.addnstr(input_y, 0, prompt[: width - 1].ljust(width - 1), width - 1,
+                           curses.A_BOLD | curses.color_pair(10))
+        except curses.error:
+            pass
+
+        status_y = input_y + 1
+        if status or is_running:
+            label = status or ""
+            if is_running:
+                if label:
+                    label += " | "
+                label += "AI thinking..."
+            try:
+                stdscr.addnstr(status_y, 0, label[: width - 1].ljust(width - 1), width - 1,
+                               curses.A_DIM | curses.color_pair(9))
+            except curses.error:
+                pass
+
+    def _start_chat_request(self, user_text: str):
+        """Append user message and launch background worker for the agent."""
+        with self._chat_lock:
+            self.chat_messages.append({"role": "user", "content": user_text})
+            if len(self.chat_messages) > 50:
+                self.chat_messages = self.chat_messages[-50:]
+            if self.chat_is_running:
+                return
+            self.chat_is_running = True
+            self.chat_status_msg = ""
+
+        worker = threading.Thread(target=self._chat_worker, args=(user_text,), daemon=True)
+        worker.start()
+
+    def _build_ui_context_for_chat(self) -> dict:
+        """Build a minimal ui_context snapshot for the agent."""
+        ctx: dict = {}
+        visible = self._visible_rows()
+
+        selected_kernel = None
+        if visible and 0 <= self.cursor < len(visible):
+            n = visible[self.cursor]
+            if n.type == "kernel":
+                selected_kernel = {
+                    "name": n.name,
+                    "duration_ms": n.duration_ms,
+                    "stream": n.stream,
+                }
+        ctx["selected_kernel"] = selected_kernel
+
+        trim_start, trim_end = self.trim
+        view_state = {
+            "time_range_s": [trim_start / 1e9, trim_end / 1e9],
+        }
+        if visible and 0 <= self.cursor < len(visible):
+            view_state["scope"] = visible[self.cursor].path or ""
+        ctx["view_state"] = view_state
+
+        ctx["stats"] = {
+            "total_gpu_ms": self.total_gpu_ms,
+            "kernel_count": self.total_kernels,
+            "nvtx_count": self.total_nvtx,
+        }
+        return ctx
+
+    def _chat_worker(self, user_text: str):
+        """Background worker: call the shared agent and update chat messages."""
+        try:
+            model = chat_mod.get_default_model()
+        except Exception:
+            model = None
+
+        if not model:
+            with self._chat_lock:
+                self.chat_messages.append(
+                    {"role": "system", "content": "LLM is not configured (no API key)."}
+                )
+                self.chat_is_running = False
+                self.chat_status_msg = ""
+            try:
+                curses.ungetch(0)
+            except curses.error:
+                pass
+            return
+
+        with self._chat_lock:
+            history = [
+                {"role": m.get("role", "user"), "content": m.get("content", "")}
+                for m in self.chat_messages[-10:]
+            ]
+
+        ui_context = self._build_ui_context_for_chat()
+
+        content = ""
+        actions = []
+        assistant_idx = None
+        try:
+            stream = chat_mod.stream_agent_loop(
+                model=model,
+                messages=history,
+                ui_context=ui_context,
+                tools=chat_mod._tools_openai(),
+                profile_path=self.db_path,
+                max_turns=5,
+            )
+            for ev in stream:
+                t = ev.get("type")
+                if t == "text":
+                    with self._chat_lock:
+                        if assistant_idx is None:
+                            self.chat_messages.append({"role": "assistant", "content": ""})
+                            assistant_idx = len(self.chat_messages) - 1
+                        content += ev.get("content", "")
+                        if assistant_idx is not None and assistant_idx < len(self.chat_messages):
+                            self.chat_messages[assistant_idx]["content"] = content
+                    try:
+                        curses.ungetch(0)
+                    except curses.error:
+                        pass
+                elif t == "system":
+                    with self._chat_lock:
+                        self.chat_status_msg = (ev.get("content", "") or "")[:60]
+                    try:
+                        curses.ungetch(0)
+                    except curses.error:
+                        pass
+                elif t == "action":
+                    act = ev.get("action")
+                    if act:
+                        actions.append(act)
+                elif t == "done":
+                    break
+        except Exception as e:
+            content = f"LLM error: {e}"
+            actions = []
+
+        with self._chat_lock:
+            if content and assistant_idx is not None and assistant_idx < len(self.chat_messages):
+                self.chat_messages[assistant_idx]["content"] = content
+            elif content and (assistant_idx is None or assistant_idx >= len(self.chat_messages)):
+                self.chat_messages.append({"role": "assistant", "content": content})
+            # Distill history to compress tool call/result sequences for lean context.
+            try:
+                self.chat_messages[:] = chat_mod.distill_history(self.chat_messages)
+            except Exception:
+                pass  # Non-critical
+            if len(self.chat_messages) > 50:
+                self.chat_messages = self.chat_messages[-50:]
+            self.chat_is_running = False
+            self.chat_status_msg = ""
+
+        for action in actions or []:
+            try:
+                tui_actions.execute_tui_action(action, self)
+            except Exception:
+                continue
+
+        try:
+            curses.ungetch(0)
+        except curses.error:
+            pass
+
+    # TUI-side navigation APIs for AI actions
+    def scroll_to_kernel(self, target_name: str, occurrence_index: int = 1):
+        """Scroll to the Nth kernel with the given name."""
+        # Ensure scopes are expanded so kernels are visible.
+        self._expand_all()
+        matches = []
+        for idx, node in enumerate(self.all_nodes):
+            if node.type == "kernel" and node.name == target_name:
+                matches.append((idx, node))
+        if not matches:
+            self.status_msg = f'AI: kernel not found: {target_name}'
+            return
+        occ = max(1, occurrence_index)
+        if occ > len(matches):
+            occ = len(matches)
+        _, target_node = matches[occ - 1]
+
+        visible = self._visible_rows()
+        target_visible_idx = None
+        for i, n in enumerate(visible):
+            if n is target_node:
+                target_visible_idx = i
+                break
+        if target_visible_idx is None:
+            self.status_msg = f'AI: kernel not visible: {target_name}'
+            return
+
+        self.cursor = target_visible_idx
+        self.status_msg = f'AI: navigated to {target_name} ({occ}/{len(matches)})'
+
+    def zoom_to_time_range(self, start_s: float, end_s: float):
+        """Zoom tree view to a specific time range (seconds)."""
+        if end_s <= start_s:
+            return
+        start_ns = int(start_s * 1e9)
+        end_ns = int(end_s * 1e9)
+        self.trim = (start_ns, end_ns)
+        self._reload()
+        visible = self._visible_rows()
+        if not visible:
+            return
+        # Move cursor to first kernel inside the range, if any.
+        best_idx = 0
+        for i, n in enumerate(visible):
+            if n.type == "kernel" and n.start_ns is not None:
+                if start_ns <= n.start_ns <= end_ns:
+                    best_idx = i
+                    break
+        self.cursor = best_idx
+        self.status_msg = f'AI: zoom {start_s:.3f}s-{end_s:.3f}s'
 
 
 def render_tree(roots: list[dict], title: str = "NVTX Tree",
@@ -967,7 +1261,7 @@ def run_tui(db_path: str, device: int, trim: tuple[int, int],
     except Exception:
         pass
 
-    trim_label = f"{trim[0] / 1e9:.1f}s – {trim[1] / 1e9:.1f}s"
+    trim_label = f"{trim[0] / 1e9:.1f}s - {trim[1] / 1e9:.1f}s"
     title = f"{gpu_name}  |  {trim_label}"
 
     # If not a terminal (piped), fall back to static rich rendering

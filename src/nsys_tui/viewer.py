@@ -1,5 +1,5 @@
 """
-viewer.py — Generate interactive HTML visualizations for Nsight profiles.
+viewer.py - Generate interactive HTML visualizations for Nsight profiles.
 
 Uses string.Template with HTML template files for clean separation between
 Python logic and HTML/CSS/JS presentation.
@@ -28,14 +28,23 @@ def generate_html(prof, device: int, trim: tuple[int, int]) -> str:
     gpu_info = prof.meta.gpu_info.get(device)
     gpu_label = f"GPU {device}"
     if gpu_info:
-        gpu_label += (f" — {gpu_info.name} ({gpu_info.pci_bus}), "
+        gpu_label += (f" - {gpu_info.name} ({gpu_info.pci_bus}), "
                       f"{gpu_info.sm_count} SMs, {gpu_info.memory_bytes/1e9:.0f}GB")
 
+    # Stable id for this profile view (device + time window) for profile-bound chat history
+    trim_sec = (trim[0] / 1e9, trim[1] / 1e9)
+    profile_id = f"{device}_{trim_sec[0]:.1f}_{trim_sec[1]:.1f}"
+
     tmpl = _load_template("nvtx_tree.html")
+    db_agent_flag = os.environ.get("NSYS_AI_DB_AGENT", "").strip().lower()
+    db_agent_enabled = bool(db_agent_flag) and db_agent_flag not in ("0", "false", "no", "off")
     return tmpl.safe_substitute(
         DATA=json.dumps(tree_json),
         GPU_LABEL=gpu_label,
-        TRIM_LABEL=f"{trim[0]/1e9:.1f}s – {trim[1]/1e9:.1f}s",
+        TRIM_LABEL=f"{trim[0]/1e9:.1f}s - {trim[1]/1e9:.1f}s",
+        PROFILE_ID=profile_id,
+        PROFILE_PATH=prof.path,
+        DB_AGENT_ENABLED="1" if db_agent_enabled else "",
     )
 
 
@@ -53,14 +62,14 @@ def generate_timeline_html(prof, device: int, trim: tuple[int, int]) -> str:
     gpu_info = prof.meta.gpu_info.get(device)
     gpu_label = f"GPU {device}"
     if gpu_info:
-        gpu_label += (f" — {gpu_info.name} ({gpu_info.pci_bus}), "
+        gpu_label += (f" - {gpu_info.name} ({gpu_info.pci_bus}), "
                       f"{gpu_info.sm_count} SMs, {gpu_info.memory_bytes/1e9:.0f}GB")
 
     tmpl = _load_template("timeline.html")
     return tmpl.safe_substitute(
         DATA=json.dumps(tree_json),
         GPU_LABEL=gpu_label,
-        TRIM_LABEL=f"{trim[0]/1e9:.1f}s – {trim[1]/1e9:.1f}s",
+        TRIM_LABEL=f"{trim[0]/1e9:.1f}s - {trim[1]/1e9:.1f}s",
     )
 
 
