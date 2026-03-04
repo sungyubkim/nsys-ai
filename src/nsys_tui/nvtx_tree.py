@@ -12,13 +12,14 @@ Mixing threads breaks containment-based nesting.
 
 def _find_primary_thread(profile, device: int) -> int:
     """Find the CPU thread with the most kernel launches on this device."""
-    rows = profile.conn.execute("""
-        SELECT r.globalTid, COUNT(*) as cnt
-        FROM CUPTI_ACTIVITY_KIND_RUNTIME r
-        JOIN CUPTI_ACTIVITY_KIND_KERNEL k ON r.correlationId = k.correlationId
-        WHERE k.deviceId = ?
-        GROUP BY r.globalTid ORDER BY cnt DESC LIMIT 1
-    """, (device,)).fetchone()
+    with profile._lock:
+        rows = profile.conn.execute("""
+            SELECT r.globalTid, COUNT(*) as cnt
+            FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+            JOIN CUPTI_ACTIVITY_KIND_KERNEL k ON r.correlationId = k.correlationId
+            WHERE k.deviceId = ?
+            GROUP BY r.globalTid ORDER BY cnt DESC LIMIT 1
+        """, (device,)).fetchone()
     return rows[0] if rows else 0
 
 
@@ -42,19 +43,21 @@ def build_nvtx_tree(profile, device: int, trim: tuple[int, int],
         return []
 
     # Load runtime calls for primary thread
-    rt_rows = profile.conn.execute("""
-        SELECT start, [end], correlationId FROM CUPTI_ACTIVITY_KIND_RUNTIME
-        WHERE globalTid = ? AND start >= ? AND [end] <= ?  ORDER BY start
-    """, (primary_tid, trim[0] - pad, trim[1] + int(2e9))).fetchall()
+    with profile._lock:
+        rt_rows = profile.conn.execute("""
+            SELECT start, [end], correlationId FROM CUPTI_ACTIVITY_KIND_RUNTIME
+            WHERE globalTid = ? AND start >= ? AND [end] <= ?  ORDER BY start
+        """, (primary_tid, trim[0] - pad, trim[1] + int(2e9))).fetchall()
 
     # Load NVTX for primary thread only
-    nvtx_rows = profile.conn.execute("""
-        SELECT text, start, [end] FROM NVTX_EVENTS
-        WHERE text IS NOT NULL AND [end] > start
-          AND globalTid = ?
-          AND start >= ? AND start <= ?
-        ORDER BY start
-    """, (primary_tid, trim[0] - pad, trim[1])).fetchall()
+    with profile._lock:
+        nvtx_rows = profile.conn.execute("""
+            SELECT text, start, [end] FROM NVTX_EVENTS
+            WHERE text IS NOT NULL AND [end] > start
+              AND globalTid = ?
+              AND start >= ? AND start <= ?
+            ORDER BY start
+        """, (primary_tid, trim[0] - pad, trim[1])).fetchall()
 
     # Build projected entries: each NVTX span → projected GPU bounds + child kernels
     entries = []  # list of {name, gpu_start, gpu_end, cpu_start, cpu_end, kernels: [...]}
