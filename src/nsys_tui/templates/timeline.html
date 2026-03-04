@@ -1144,10 +1144,21 @@
             }, 150);
         }
 
+        function clampView() {
+            const minNs = profileMeta ? profileMeta.time_range_ns[0] : timeStart;
+            const maxNs = profileMeta ? profileMeta.time_range_ns[1] : timeEnd;
+            const span = viewEnd - viewStart;
+            if (viewStart < minNs) { viewStart = minNs; viewEnd = minNs + span; }
+            if (viewEnd > maxNs) { viewEnd = maxNs; viewStart = maxNs - span; }
+            // Final clamp in case span > total range
+            if (viewStart < minNs) viewStart = minNs;
+        }
+
         function panBy(fraction) {
             const span = viewEnd - viewStart;
             const delta = span * fraction;
             viewStart += delta; viewEnd += delta;
+            clampView();
             draw();
             afterViewChange();
         }
@@ -1160,15 +1171,20 @@
             const ratio = (centerNs - viewStart) / span;
             viewStart = centerNs - newSpan * ratio;
             viewEnd = centerNs + newSpan * (1 - ratio);
+            clampView();
             draw();
             afterViewChange();
         }
         function zoomIn() { zoomAt(0.5); }
         function zoomOut() { zoomAt(2); }
         function fitAll() {
-            viewStart = timeStart - timeSpan * 0.02;
-            viewEnd = timeEnd + timeSpan * 0.02;
+            const minNs = profileMeta ? profileMeta.time_range_ns[0] : timeStart;
+            const maxNs = profileMeta ? profileMeta.time_range_ns[1] : timeEnd;
+            const range = maxNs - minNs;
+            viewStart = minNs - range * 0.02;
+            viewEnd = maxNs + range * 0.02;
             draw();
+            afterViewChange();
         }
 
         function selectKernel(k) {
@@ -1254,8 +1270,9 @@
                 const w = canvas.width / DPR - LABEL_W;
                 const nsPerPx = (dragViewEnd - dragViewStart) / w;
                 viewStart = dragViewStart - dx * nsPerPx;
-                afterViewChange();
                 viewEnd = dragViewEnd - dx * nsPerPx;
+                clampView();
+                afterViewChange();
                 draw();
                 return;
             }
