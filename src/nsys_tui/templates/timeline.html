@@ -123,7 +123,8 @@
 
         #canvasWrap {
             flex: 1;
-            overflow: hidden;
+            overflow-x: hidden;
+            overflow-y: auto;
             position: relative;
             cursor: crosshair
         }
@@ -133,13 +134,20 @@
         }
 
         #detail {
-            height: 120px;
+            height: 80px;
             border-top: 1px solid var(--border);
-            padding: 8px 16px;
+            padding: 6px 16px;
             overflow-y: auto;
             flex-shrink: 0;
             font-size: 12px;
-            background: var(--surface)
+            background: var(--surface);
+            cursor: pointer;
+            transition: height 0.15s;
+        }
+
+        #detail.collapsed {
+            height: 24px;
+            overflow: hidden;
         }
 
         #detail.empty {
@@ -491,32 +499,68 @@
         const ctx = canvas.getContext('2d');
         const wrap = document.getElementById('canvasWrap');
 
-        // ── Data extraction ──
+        // ── Data extraction (multi-GPU aware) ──
         const allNodes = []; const kernels = []; const nvtxSpans = [];
-        function extractData(nodes, path, depth) {
+        const gpuIds = [];
+        const isMultiGPU = DATA.gpus && DATA.gpus.length > 1;
+
+        function extractData(nodes, path, depth, gpuId) {
             for (const n of nodes) {
                 const np = path ? path + ' > ' + n.name : n.name;
-                n._path = np; n._depth = depth;
+                n._path = np; n._depth = depth; n._gpu = gpuId;
                 allNodes.push(n);
                 if (n.type === 'kernel') { n._path = np; kernels.push(n); }
                 else if (n.type === 'nvtx' && n.start_ns && n.end_ns) {
-                    nvtxSpans.push({ name: n.name, start: n.start_ns, end: n.end_ns, depth, path: np, dur: n.duration_ms });
+                    nvtxSpans.push({ name: n.name, start: n.start_ns, end: n.end_ns, depth, path: np, dur: n.duration_ms, gpu: gpuId });
                 }
-                if (n.children) extractData(n.children, np, depth + 1);
+                if (n.children) extractData(n.children, np, depth + 1, gpuId);
             }
         }
-        extractData(DATA, '', 0);
+
+        // Handle new multi-GPU format: {gpus: [{id, data}, ...]}
+        // and legacy single-GPU format: [node, ...]
+        if (DATA.gpus) {
+            for (const gpuEntry of DATA.gpus) {
+                gpuIds.push(gpuEntry.id);
+                extractData(gpuEntry.data, '', 0, gpuEntry.id);
+            }
+        } else {
+            // Legacy: flat array = single GPU
+            gpuIds.push(0);
+            extractData(DATA, '', 0, 0);
+        }
         kernels.sort((a, b) => a.start_ns - b.start_ns);
 
-        // Streams
+        // Streams — keyed by "gpuId:streamId" for multi-GPU, just streamId for single
         const streamMap = {};
-        kernels.forEach(k => { const s = k.stream !== undefined ? String(k.stream) : '?'; if (!streamMap[s]) streamMap[s] = []; streamMap[s].push(k); });
-        const streamIds = Object.keys(streamMap).sort((a, b) => {
-            const ai = parseInt(a), bi = parseInt(b);
-            if (!isNaN(ai) && !isNaN(bi)) return ai - bi;
-            return a.localeCompare(b);
+        kernels.forEach(k => {
+            const rawStream = k.stream !== undefined ? String(k.stream) : '?';
+            const key = isMultiGPU ? `${k._gpu}:${rawStream}` : rawStream;
+            k._streamKey = key;
+            if (!streamMap[key]) streamMap[key] = [];
+            streamMap[key].push(k);
         });
-        streamIds.forEach(s => streamMap[s].sort((a, b) => a.start_ns - b.start_ns));
+
+        // Build ordered stream list: group by GPU, sorted by stream ID within each GPU
+        const streamIds = [];
+        const gpuBands = []; // [{gpuId, startIdx, endIdx}] for separator rows
+        for (const gpuId of gpuIds) {
+            const startIdx = streamIds.length;
+            const gpuStreams = Object.keys(streamMap)
+                .filter(k => isMultiGPU ? k.startsWith(gpuId + ':') : true)
+                .sort((a, b) => {
+                    const aNum = parseInt(a.split(':').pop());
+                    const bNum = parseInt(b.split(':').pop());
+                    if (!isNaN(aNum) && !isNaN(bNum)) return aNum - bNum;
+                    return a.localeCompare(b);
+                });
+            // Only add streams not already added (for single-GPU case)
+            for (const s of gpuStreams) {
+                if (!streamIds.includes(s)) streamIds.push(s);
+            }
+            gpuBands.push({ gpuId, startIdx, endIdx: streamIds.length });
+        }
+        Object.values(streamMap).forEach(ks => ks.sort((a, b) => a.start_ns - b.start_ns));
 
         // Time bounds
         const timeStart = kernels.length ? Math.min(...kernels.map(k => k.start_ns), ...nvtxSpans.map(s => s.start)) : 0;
@@ -530,10 +574,12 @@
         const totalKernels = kernels.length;
         const totalNVTX = nvtxSpans.length;
         const totalMs = kernels.reduce((a, k) => a + k.duration_ms, 0);
+        const gpuCountLabel = gpuIds.length > 1 ? `GPUs: <strong>${gpuIds.length}</strong> &nbsp; ` : '';
         document.getElementById('stats').innerHTML =
+            gpuCountLabel +
             `<span>Kernels: <strong>${totalKernels}</strong></span> &nbsp; ` +
             `<span>NVTX: <strong>${totalNVTX}</strong></span> &nbsp; ` +
-            `<span>GPU: <strong>${totalMs.toFixed(1)}ms</strong></span>`;
+            `<span>GPU time: <strong>${totalMs.toFixed(1)}ms</strong></span>`;
 
         // ── State ──
         let viewStart = timeStart - timeSpan * 0.02;
@@ -546,17 +592,19 @@
         let isDragging = false, dragStartX = 0, dragViewStart = 0, dragViewEnd = 0;
 
         // ── Layout constants ──
-        const LABEL_W = 90;
+        const LABEL_W = isMultiGPU ? 110 : 90;
         const RULER_H = 24;
         const NVTX_ROW_H = 20;
         const STREAM_H = 32;
         const STREAM_GAP = 2;
+        const GPU_SEP_H = isMultiGPU ? 22 : 0;
         const MIN_BLOCK_W = 2;
         const DPR = window.devicePixelRatio || 1;
 
         // ── Colors (vivid so bars stand out on dark background; background unchanged) ──
         const STREAM_COLORS = ['#3fb950', '#58a6ff', '#bc8cff', '#ff7b7b', '#d4a72c', '#79b8ff', '#56d364'];
         const NVTX_COLORS = ['#5b8dc9', '#8b7ab8', '#3d9b6e', '#c76b7a', '#b89b4d', '#6b9bc4'];
+        const GPU_SEP_COLORS = ['#58a6ff', '#bc8cff', '#3fb950', '#ff7b7b'];
 
         function streamColor(idx) { return STREAM_COLORS[idx % STREAM_COLORS.length]; }
         function nvtxColor(depth) { return NVTX_COLORS[depth % NVTX_COLORS.length]; }
@@ -566,12 +614,18 @@
         function fmtNs(ns) { return (ns / 1e6).toFixed(3) + 'ms'; }
 
         // ── Resize ──
+        function contentHeight() {
+            // Total height needed: ruler + NVTX + GPU separators + all stream rows
+            const gpuSeps = isMultiGPU ? gpuBands.length * GPU_SEP_H : 0;
+            return RULER_H + nvtxAreaH() + gpuSeps + streamIds.length * (STREAM_H + STREAM_GAP) + 20;
+        }
         function resize() {
             const r = wrap.getBoundingClientRect();
+            const needH = Math.max(r.height, contentHeight());
             canvas.width = r.width * DPR;
-            canvas.height = r.height * DPR;
+            canvas.height = needH * DPR;
             canvas.style.width = r.width + 'px';
-            canvas.style.height = r.height + 'px';
+            canvas.style.height = needH + 'px';
             ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
             draw();
         }
@@ -588,7 +642,18 @@
         }
 
         function nvtxAreaH() { return showNVTX && nvtxSpans.length ? nvtxMaxDepth * NVTX_ROW_H + 4 : 0; }
-        function streamY(idx) { return RULER_H + nvtxAreaH() + idx * (STREAM_H + STREAM_GAP); }
+
+        // Compute Y position for a stream index, accounting for GPU separator rows
+        function streamY(idx) {
+            let y = RULER_H + nvtxAreaH();
+            let sepsAbove = 0;
+            if (isMultiGPU) {
+                for (const band of gpuBands) {
+                    if (idx >= band.startIdx && band.startIdx > 0) sepsAbove++;
+                }
+            }
+            return y + idx * (STREAM_H + STREAM_GAP) + sepsAbove * GPU_SEP_H;
+        }
 
         // ── Draw ──
         function draw() {
@@ -640,7 +705,15 @@
             ctx.fillStyle = 'rgba(22, 27, 34, 0.85)';
             ctx.fillRect(0, baseY, W, nvtxAreaH());
 
+            // In multi-GPU mode, only show NVTX for the GPU of the selected stream
+            let activeGpu = null;
+            if (isMultiGPU && streamIds[selectedStreamIdx]) {
+                const parts = streamIds[selectedStreamIdx].split(':');
+                activeGpu = parseInt(parts[0]);
+            }
+
             for (const span of nvtxSpans) {
+                if (isMultiGPU && activeGpu !== null && span.gpu !== activeGpu) continue;
                 if (span.depth >= nvtxMaxDepth) continue;
                 const x1 = Math.max(LABEL_W, nsToX(span.start));
                 const x2 = Math.min(W, nsToX(span.end));
@@ -680,6 +753,14 @@
                 ctx.font = '9px SF Mono, monospace';
                 ctx.fillText('L' + d, LABEL_W - 6, baseY + d * NVTX_ROW_H + NVTX_ROW_H / 2);
             }
+            // Show which GPU's NVTX is displayed
+            if (isMultiGPU && activeGpu !== null) {
+                ctx.fillStyle = GPU_SEP_COLORS[gpuIds.indexOf(activeGpu) % GPU_SEP_COLORS.length];
+                ctx.font = '9px SF Mono, monospace';
+                ctx.textAlign = 'left';
+                ctx.textBaseline = 'top';
+                ctx.fillText(`NVTX: GPU ${activeGpu}`, LABEL_W + 4, baseY + 2);
+            }
             ctx.font = '11px SF Mono, Cascadia Code, Fira Code, monospace';
 
             // Separator
@@ -689,12 +770,58 @@
         }
 
         function drawStreams(W, H) {
-            const baseY = RULER_H + nvtxAreaH();
+            // Draw GPU separator rows first (if multi-GPU)
+            if (isMultiGPU) {
+                for (let gi = 0; gi < gpuBands.length; gi++) {
+                    const band = gpuBands[gi];
+                    if (band.startIdx === 0) continue;  // No separator before first GPU
+                    const sepY = streamY(band.startIdx) - GPU_SEP_H;
+                    const sepColor = GPU_SEP_COLORS[gi % GPU_SEP_COLORS.length];
+
+                    // Background bar
+                    ctx.fillStyle = '#0d1117';
+                    ctx.fillRect(0, sepY, W, GPU_SEP_H);
+
+                    // Colored accent line
+                    ctx.fillStyle = sepColor;
+                    ctx.globalAlpha = 0.6;
+                    ctx.fillRect(0, sepY, W, 2);
+                    ctx.globalAlpha = 1;
+
+                    // GPU label
+                    ctx.fillStyle = sepColor;
+                    ctx.font = '10px SF Mono, Cascadia Code, Fira Code, monospace';
+                    ctx.textAlign = 'left';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(`── GPU ${band.gpuId} ──`, 8, sepY + GPU_SEP_H / 2 + 1);
+                    ctx.font = '11px SF Mono, Cascadia Code, Fira Code, monospace';
+                }
+                // First GPU header at top of streams area
+                if (gpuBands.length > 0) {
+                    const band = gpuBands[0];
+                    const topY = streamY(0) - GPU_SEP_H;
+                    if (topY >= RULER_H + nvtxAreaH() - GPU_SEP_H) {
+                        const sepColor = GPU_SEP_COLORS[0];
+                        ctx.fillStyle = '#0d1117';
+                        ctx.fillRect(0, RULER_H + nvtxAreaH(), W, GPU_SEP_H);
+                        ctx.fillStyle = sepColor;
+                        ctx.globalAlpha = 0.6;
+                        ctx.fillRect(0, RULER_H + nvtxAreaH(), W, 2);
+                        ctx.globalAlpha = 1;
+                        ctx.fillStyle = sepColor;
+                        ctx.font = '10px SF Mono, Cascadia Code, Fira Code, monospace';
+                        ctx.textAlign = 'left';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText(`── GPU ${band.gpuId} ──`, 8, RULER_H + nvtxAreaH() + GPU_SEP_H / 2 + 1);
+                        ctx.font = '11px SF Mono, Cascadia Code, Fira Code, monospace';
+                    }
+                }
+            }
 
             for (let si = 0; si < streamIds.length; si++) {
                 const sid = streamIds[si];
                 const ks = streamMap[sid];
-                const y = streamY(si);
+                const y = streamY(si) + (isMultiGPU && gpuBands[0].startIdx === 0 ? GPU_SEP_H : 0);
                 const isSelected = si === selectedStreamIdx;
                 const color = streamColor(si);
 
@@ -709,7 +836,15 @@
                 ctx.textAlign = 'right';
                 ctx.textBaseline = 'middle';
                 const isNccl = ks.some(k => k.name.toLowerCase().includes('nccl'));
-                ctx.fillText((isNccl ? '⚡ ' : '') + 'S' + sid, LABEL_W - 6, y + STREAM_H / 2);
+                let streamLabel;
+                if (isMultiGPU) {
+                    // "G0:S21" format
+                    const parts = sid.split(':');
+                    streamLabel = (isNccl ? '⚡ ' : '') + 'G' + parts[0] + ':S' + parts[1];
+                } else {
+                    streamLabel = (isNccl ? '⚡ ' : '') + 'S' + sid;
+                }
+                ctx.fillText(streamLabel, LABEL_W - 6, y + STREAM_H / 2);
 
                 // Kernel blocks
                 for (const k of ks) {
@@ -776,7 +911,7 @@
         // ── Hit testing ──
         function hitTest(mx, my) {
             for (let si = 0; si < streamIds.length; si++) {
-                const y = streamY(si);
+                const y = streamY(si) + (isMultiGPU && gpuBands[0].startIdx === 0 ? GPU_SEP_H : 0);
                 if (my < y || my > y + STREAM_H) continue;
                 const ks = streamMap[streamIds[si]];
                 for (const k of ks) {
@@ -795,16 +930,17 @@
         function showDetail(k) {
             if (!k) {
                 document.getElementById('detail').className = 'empty';
-                document.getElementById('detail').innerHTML = 'Click a kernel to see details. Keyboard: ←/→ pan, +/- zoom, ↑/↓ stream, / search, ? help';
+                document.getElementById('detail').innerHTML = 'Click a kernel to see details. Press A for AI chat. Keyboard: ←/→ pan, +/- zoom, ↑/↓ stream, / search, ? help';
                 return;
             }
             const parts = (k._path || '').split(' > ');
             const pathHtml = parts.slice(0, -1).map(p => `<span>${escH(p)}</span>`).join('<span class="sep">›</span>');
+            const gpuLabel = isMultiGPU ? ` &nbsp;|&nbsp; GPU ${k._gpu}` : '';
 
             document.getElementById('detail').className = '';
             document.getElementById('detail').innerHTML =
                 `<div class="detail-name">⚡ ${escH(k.name)}</div>` +
-                `<div class="detail-dur">${fmtDur(k.duration_ms)} &nbsp;|&nbsp; Stream ${k.stream ?? '?'} &nbsp;|&nbsp; ${fmtNs(k.start_ns)} → ${fmtNs(k.end_ns)}</div>` +
+                `<div class="detail-dur">${fmtDur(k.duration_ms)} &nbsp;|&nbsp; Stream ${k.stream ?? '?'}${gpuLabel} &nbsp;|&nbsp; ${fmtNs(k.start_ns)} → ${fmtNs(k.end_ns)}</div>` +
                 (pathHtml ? `<div class="detail-path">📦 ${pathHtml}</div>` : '');
         }
 

@@ -254,8 +254,11 @@ def _cmd_perfetto(args, _profile):
 def _cmd_timeline_web(args, _profile):
     from .web import serve_timeline
     with _profile.open(args.profile) as prof:
-        gpu = args.gpu if args.gpu is not None else (prof.meta.devices[0] if prof.meta.devices else 0)
-        serve_timeline(prof, gpu, _parse_trim(args),
+        if args.gpu is not None:
+            devices = args.gpu
+        else:
+            devices = prof.meta.devices if prof.meta.devices else [0]
+        serve_timeline(prof, devices, _parse_trim(args),
                        port=args.port, open_browser=not args.no_browser)
 
 
