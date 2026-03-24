@@ -41,8 +41,15 @@ def _resolve_activity_tables(conn: sqlite3.Connection) -> dict[str, str]:
                 row[0]
                 for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             }
-    except Exception:
+    except (sqlite3.Error, ImportError) as exc:
+        _log.debug("Failed to resolve activity tables: %s", exc, exc_info=True)
         return {}
+    except Exception as exc:
+        # Catch duckdb.Error without importing duckdb at module level
+        if type(exc).__module__.startswith("duckdb"):
+            _log.debug("Failed to resolve activity tables (duckdb): %s", exc, exc_info=True)
+            return {}
+        raise
 
     def _find_by_prefix(prefix: str) -> str | None:
         if prefix in tables:
@@ -211,8 +218,15 @@ class Skill:
                         ).fetchone()[0]
                         > 0
                     )
-            except Exception:
+            except (sqlite3.Error, ImportError) as exc:
+                _log.debug("NVTX textId detection failed: %s", exc, exc_info=True)
                 has_textid = False
+            except Exception as exc:
+                if type(exc).__module__.startswith("duckdb"):
+                    _log.debug("NVTX textId detection failed (duckdb): %s", exc, exc_info=True)
+                    has_textid = False
+                else:
+                    raise
             if has_textid:
                 resolved.setdefault("nvtx_text_expr", "COALESCE(n.text, s2.value)")
                 resolved.setdefault("nvtx_text_join", "LEFT JOIN StringIds s2 ON n.textId = s2.id")
@@ -226,9 +240,25 @@ class Skill:
         if isinstance(conn, _ddb.DuckDBPyConnection):
             from nsys_ai.sql_compat import sqlite_to_duckdb
             sql = sqlite_to_duckdb(sql)
-        cursor = conn.execute(sql)
-        columns = [desc[0] for desc in cursor.description] if cursor.description else []
-        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        try:
+            cursor = conn.execute(sql)
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as exc:
+            db_errors = (sqlite3.Error,)
+            try:
+                import duckdb
+                db_errors += (duckdb.Error,)
+            except ImportError:
+                pass
+
+            if not isinstance(exc, db_errors):
+                raise
+
+            from nsys_ai.exceptions import SkillExecutionError
+            raise SkillExecutionError(
+                f"SQL failed: {exc}", skill_name=self.name
+            ) from exc
 
     def format_rows(self, rows: list[dict]) -> str:
         """Format pre-computed rows as text (no re-execution)."""

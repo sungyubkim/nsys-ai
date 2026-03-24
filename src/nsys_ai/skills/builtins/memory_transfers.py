@@ -165,12 +165,11 @@ def _execute_h2d_dist(conn, **kwargs):
 
     This function is assigned as ``H2D_DIST_SKILL.execute_fn`` and wraps the
     underlying SQL execution so that if the memcpy table does not exist, it
-    returns an empty result instead of propagating an sqlite3.OperationalError.
+    returns an empty result instead of propagating a ``SkillExecutionError``.
 
     After executing the SQL, appends a pattern classification dict as the
     last element of the result list.
     """
-    import sqlite3
 
     # Create a temporary Skill that uses the same SQL but no custom execute_fn
     temp_skill = Skill(
@@ -182,11 +181,11 @@ def _execute_h2d_dist(conn, **kwargs):
         format_fn=H2D_DIST_SKILL.format_fn,
         tags=getattr(H2D_DIST_SKILL, "tags", None),
     )
-    import duckdb
 
+    from nsys_ai.exceptions import SkillExecutionError
     try:
         rows = temp_skill.execute(conn, **kwargs)
-    except (sqlite3.OperationalError, duckdb.Error) as exc:
+    except SkillExecutionError as exc:
         err_msg = str(exc).lower()
         if "no such table" in err_msg or "does not exist" in err_msg:
             return []

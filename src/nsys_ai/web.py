@@ -11,6 +11,7 @@ Usage:
 """
 
 import json
+import logging
 import os
 import queue
 import signal
@@ -20,6 +21,8 @@ import time as _time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import quote
+
+_log = logging.getLogger(__name__)
 
 _FINDINGS_LOCK = threading.Lock()
 
@@ -62,8 +65,10 @@ class _ThreadPoolMixIn(socketserver.ThreadingMixIn):
                     self.process_request_thread(request, client_address)
                 except Exception:
                     self.handle_error(request, client_address)
+            except OSError as exc:
+                _log.debug("Pool worker OS error: %s", exc, exc_info=True)
             except Exception:
-                pass
+                _log.error("Unexpected pool worker error", exc_info=True)
 
 
 class _ThreadedHTTPServer(_ThreadPoolMixIn, socketserver.ThreadingMixIn, HTTPServer):
@@ -184,7 +189,8 @@ class _ViewerHandler(BaseHTTPRequestHandler):
 
                 options = chat_mod.get_available_models()
                 default = chat_mod.get_default_model()
-            except Exception:
+            except Exception as exc:
+                _log.debug("Model listing unavailable: %s", exc, exc_info=True)
                 options = []
                 default = None
             self._json_response({"default": default, "options": options})
@@ -348,6 +354,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         except Exception as e:
+            _log.exception("Tile data error: %s", e)
             elapsed = _time.monotonic() - t0
             print(f"[tile] {start_s:.1f}s–{end_s:.1f}s  ERROR in {elapsed:.2f}s: {e}", flush=True)
             self._json_response({"error": str(e)}, 500)
@@ -377,6 +384,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             )
             self._json_response(findings)
         except Exception as e:
+            _log.exception("Analyze error")
             print(f"[analyze] Error: {e}", flush=True)
             self._json_response({"error": str(e)}, 500)
 
@@ -390,8 +398,13 @@ class _ViewerHandler(BaseHTTPRequestHandler):
                 self.__class__._findings.append(finding_dict)
                 idx = len(self.__class__._findings)
             self._json_response({"index": idx})
-        except Exception as e:
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, KeyError) as e:
+            # Malformed JSON, invalid UTF-8, or bad payload fields — client error.
             self._json_response({"error": str(e)}, 400)
+        except Exception as e:
+            # Unexpected server-side error — log and return 500.
+            _log.exception("Error handling POST /api/findings")
+            self._json_response({"error": str(e)}, 500)
 
     def do_POST(self):
         path = self.path.split("?")[0]
@@ -449,6 +462,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         except Exception as e:
+            _log.exception("Chat endpoint error")
             self.send_response(500)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
@@ -613,7 +627,8 @@ def serve_timeline(
                     )
                     _ViewerHandler._prebuilt_data = prebuilt
                     cache_valid = True
-            except Exception as e:
+            except (ValueError, KeyError, json.JSONDecodeError, OSError) as e:
+                _log.debug("Cache load failed: %s", e, exc_info=True)
                 print(f"Cache load failed: {e}, rebuilding...", flush=True)
 
         if not cache_valid:

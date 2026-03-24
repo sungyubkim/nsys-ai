@@ -31,11 +31,14 @@ with either data fields or an "error" block:
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from typing import Any
 
 from .hardware import get_peak_tflops
 from .profile import NsightSchema, get_first_gpu_name, resolve_profile_path
+
+_log = logging.getLogger(__name__)
 
 ErrorDict = dict[str, Any]
 RowDict = dict[str, Any]
@@ -179,8 +182,14 @@ def _detect_nvtx_text_id(conn: sqlite3.Connection) -> bool:
             cur = conn.execute("PRAGMA table_info(NVTX_EVENTS)")
             cols = [r[1] for r in cur.fetchall()]
         return "textId" in cols
-    except Exception:
+    except (sqlite3.Error, ImportError) as exc:
+        _log.debug("NVTX textId detection failed: %s", exc, exc_info=True)
         return False
+    except Exception as exc:
+        if type(exc).__module__.startswith("duckdb"):
+            _log.debug("NVTX textId detection failed (duckdb): %s", exc, exc_info=True)
+            return False
+        raise
 
 
 def find_nvtx_ranges(
@@ -744,8 +753,11 @@ def compute_region_mfu(
     available. The chat agent should prefer :func:`compute_region_mfu_from_conn`
     to reuse its existing connection.
     """
+    from nsys_ai.exceptions import NsysAiError
     try:
         sqlite_path = resolve_profile_path(profile_path)
+    except NsysAiError as e:
+        return _error(e.error_code, f"Profile error: {e}")
     except RuntimeError as e:
         return _error("PROFILE_NOT_LOADED", f"Profile error: {e}")
 

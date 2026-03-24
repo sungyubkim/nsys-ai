@@ -42,6 +42,7 @@ def _resolve_activity_tables(conn: sqlite3.Connection) -> dict[str, str]:
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
     except Exception:
+        _log.debug("Failed to resolve activity tables for indexing", exc_info=True)
         return {}
 
     def _find_by_prefix(prefix: str) -> str | None:
@@ -158,15 +159,15 @@ def ensure_performance_indexes(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError as exc:
             # "no such table" is expected (profile may lack NVTX/NCCL data).
             # Other OperationalError (locked, readonly) logged for diagnostics.
-            _log.debug("ensure_performance_indexes: %s — %s", stmt.split("ON")[0].strip(), exc)
+            _log.debug("ensure_performance_indexes: %s — %s", stmt.split("ON")[0].strip(), exc, exc_info=True)
         except Exception as exc:
-            _log.debug("ensure_performance_indexes: %s — %s", stmt.split("ON")[0].strip(), exc)
+            _log.debug("ensure_performance_indexes: %s — %s", stmt.split("ON")[0].strip(), exc, exc_info=True)
 
     if any_success:
         try:
             conn.commit()
         except Exception:
-            pass
+            _log.debug("Failed to create index", exc_info=True)
 
     # Only mark as indexed if at least one index was created.
     # This allows retry on readonly connections that are later reopened as writable.

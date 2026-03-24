@@ -12,6 +12,7 @@ import re
 import sqlite3
 from pathlib import Path
 
+from ..exceptions import SkillNotFoundError
 from .base import Skill
 
 _log = logging.getLogger(__name__)
@@ -70,8 +71,11 @@ def run_skill(name: str, conn: sqlite3.Connection, **kwargs) -> str:
     """Look up and run a skill, returning formatted text."""
     skill = get_skill(name)
     if not skill:
-        available = ", ".join(list_skills())
-        raise KeyError(f"Unknown skill '{name}'. Available: {available}")
+        available = list_skills()
+        raise SkillNotFoundError(
+            f"Unknown skill '{name}'. Available: {', '.join(available)}",
+            available=available,
+        )
     return skill.run(conn, **kwargs)
 
 
@@ -193,7 +197,7 @@ def load_custom_skills_dir(dir_path: str) -> list[Skill]:
             skill = load_skill_from_markdown(str(md_file))
             loaded.append(skill)
         except (ValueError, OSError) as exc:
-            _log.debug("Skipping %s: %s", md_file, exc)
+            _log.debug("Skipping %s: %s", md_file, exc, exc_info=True)
     return loaded
 
 
